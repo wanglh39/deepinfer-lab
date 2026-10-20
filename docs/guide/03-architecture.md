@@ -1,68 +1,44 @@
 # 03 总体架构：E/P/D 分离
 
-!!! question "本章问题"
-    - 为什么要把 prefill 和 decode 拆到**物理上不同的节点**？
-    - 一个请求的 KV 如何在集群里「搬家」？
-    - 3FS 在这套架构里扮演什么角色？
+第 02 章说过，prefill 和 decode 一个计算受限、一个访存受限，混跑互相伤害。本章讲 DeepInfer 的结构性答案：把请求的生命周期拆到**三类物理隔离的节点**上——Encoder（E）、Prefill（P）、Decode（D），中间用一个分布式文件系统 3FS 串起来。读完这章你应该能回答：为什么拆的是这三段、KV 怎么在节点间流动、以及为什么一个「文件系统」会成为整个架构的枢纽。
 
----
+## 1. 分离的动机：先把互相伤害讲具体
 
-## 1. 分离的动机：两种负载，两种芯片用法
+混跑一台机器上，伤害发生在两个方向：
 
-[第 01 章](01-overview.md) 已经看到：prefill 是**计算受限**的大矩阵乘，
-decode 是**访存受限**的单 token 前向。混跑在同一批节点上会互相拖累：
+**prefill 伤害 decode。** 一条 8000 token 的长 prompt 到达，prefill 要做一次 8000 个位置的大矩阵乘，独占计算单元几百毫秒。这期间同一块 GPU 上所有正在 decode 的请求全部停摆——用户屏幕上的字停了一下。长 prompt 越多，「卡顿」越频繁。
 
-```mermaid
-quadrantChart
-    title 负载的四象限
-    x-axis "低算术强度" --> "高算术强度"
-    y-axis "低延迟敏感" --> "高延迟敏感"
-    "decode": [0.2, 0.8]
-    "prefill": [0.85, 0.4]
-    "chunked prefill 混跑": [0.6, 0.6]
-```
+**decode 伤害 prefill。** decode 侧为了吞吐，把几十条请求的 KV Cache 常驻在显存里（这是它高吞吐的前提）。这批常驻显存挤压的是 prefill 需要的**临时激活空间**——prefill 一根 8000 token 的序列，每层中间结果都是 8000×隐藏维度的张量。KV 挤多了，长 prompt 直接分配失败（OOM）。
 
-- 一个长 prompt 的 prefill 突然进来，decode 的批被挤占 → 在跑请求的
-  TPOT 瞬间劣化（用户看到「卡了一下」）；
-- decode 常驻的大 KV 挤占 prefill 需要的临时激活显存 → 长 prompt
-  直接 OOM。
+两种负载对硬件的「最优配置」也是反的：prefill 想要算力堆满、显存临时大进大出；decode 想要带宽快、显存深（驻留更多请求）。同一批节点按谁调优都亏。
 
-解法有两档：
+解法有两档。**软分离**（chunked prefill，[第 07 章](07-scheduler.md)）：不拆机器，把长 prefill 切成小块，每算一块插一步 decode，用调度强制两类负载轮流用 GPU——单机小规模够用。**硬分离**（E/P/D）：直接拆到不同物理节点群，各自按自己的瓶颈配硬件和并行策略——这是 DeepInfer 这种大规模服务的选择。注意 DeepInfer 并没有放弃前者：分离部署的集群内部，P 节点自己跑多个并发 prefill 时仍然用 chunked 预算控制（QA 文档里的二次成本模型 cost(q, c) 就是用来反解最优 chunk 大小的）。
 
-| 方案 | 做法 | 适用 |
-|---|---|---|
-| **chunked prefill**（软分离） | 把长 prompt 切块，按时间预算混进 decode 批 | 单机/中小规模 |
-| **E/P/D 分离**（硬分离） | prefill 与 decode 跑在**不同物理节点** | 大规模、 DeepInfer 的选择 |
+## 2. 三类节点各自是什么
 
-DeepInfer 两者都用：分离部署的骨架 + 集群内仍保留 chunked prefill 的
-预算控制（QA 里提到的二次成本模型 cost(q, c) 反解 chunk 大小 q ——
-[第 07 章](07-scheduler.md) 详述）。
+### E（Encoder）：入口层
 
-## 2. 三类节点
+请求进入集群的第一站：分词（文本变 token id）、按对话模板组装（system / user / assistant 拼接、加特殊标记）、以及多模态输入的编码。它**无状态**——不碰模型权重、不存 KV，处理完就把 token 序列交给调度层。无状态意味着天然可以水平扩展（流量大了加机器就行），也意味着它和 GPU 推理解耦：入口的流量抖动不会传导到推理节点。单独设 E 这一层，本质是把「杂活」从昂贵的 GPU 节点上剥出去。
 
-**E（Encoder）**：把文本变成 token id 序列 +（推测）附带的编码服务。
-入口层，无状态，天然可水平扩展。
+### P（Prefill）：KV 的生产者
 
-**P（Prefill）**：专职 prefill。特点：
+专职 prefill。它的特征几乎全部来自第 01 章的推导——prefill 是计算受限的，所以：
 
-- 计算饱和：大 batch 矩阵乘把算力喂满，用 DeepGEMM 的
-  分块满血矩阵乘（[第 04 章](04-kernels.md)）；
-- 算完的 KV 是「产物」—— 它不消费 KV，只**生产** KV；
-- MoE 层的 all-to-all 通信在大 batch 下摊薄 —— **Wide-EP**
-  （EP64~128，专家并行开到 64~128 卡）在这一侧划算
-  （[第 05 章](05-parallelism.md)）。
+- **追求计算饱和**：把多条请求的 prompt 拼成大 batch 一起算，让 DeepGEMM 的分块矩阵乘吃满算力（[第 04 章](04-kernels.md)）；
+- **MoE 通信划算**：DeepSeek 的 MoE 层每算一层，激活的 token 要按路由发往各专家所在的卡（all-to-all 通信）。batch 越大，单次通信摊到的 token 越多，通信成本占比越低——所以 P 侧敢把专家并行开到很宽（**Wide-EP，64~128 卡**，[第 05 章](05-parallelism.md)）；
+- **不驻留 KV**：prefill 算出的 KV 是**产物**，算完就写入 3FS，本地不长期保存。P 节点的显存全部留给大 batch 的临时激活。
 
-**D（Decode）**：专职 decode。特点：
+### D（Decode）：KV 的消费者
 
-- 访存受限：核心指标是「KV 驻留密度」—— 谁能让 HBM 里塞下更多
-  请求的 KV，谁的吞吐就高；
-- **Attention DP**（数据并行）而非大 EP：每个卡独立服务一组请求的
-  完整注意力，避免 decode 小 token 数下 all-to-all 的通信死亏；
-- MoE 专家权重按卡复制/分片，路由本地化。
+专职逐 token 生成。特征来自第 01 章另一半推导——decode 是访存受限的，所以：
+
+- **核心指标是 KV 驻留密度**：HBM 里塞下越多并发请求的 KV，每步组批越大，带宽利用率越高。D 节点选卡的标准是「显存大、带宽快」而不是「算力强」；
+- **并行策略反着来**：decode 每步只有很少的 token（batch 数 × 1 个位置），MoE 的 all-to-all 通信摊不满，通信占比会反噬延迟——所以 D 侧用 **Attention DP**（数据并行：每张卡独立服务一组请求的完整注意力），MoE 专家权重按卡复制或小范围分片，把通信本地化（[第 05 章](05-parallelism.md)）；
+- **KV 长驻 + 增量写回**：decode 每步新增的 KV 写入本地块表，并异步写回 3FS。
 
 ```mermaid
 flowchart LR
-    U[用户请求] --> E[E: Encoder]
+    U[用户请求] --> E[E: Encoder<br/>分词/模板组装<br/>无状态]
     E -->|token ids| P["P: Prefill 节点<br/>计算饱和<br/>Wide-EP 64-128"]
     P -->|新算的 KV 块| FS[("3FS<br/>分布式 KV 存储")]
     FS -->|按块挂载| D["D: Decode 节点<br/>访存受限<br/>Attention DP"]
@@ -70,85 +46,72 @@ flowchart LR
     D -.->|新 KV 块写回| FS
 ```
 
+P 用大 EP、D 用小 EP/DP，这是「同一模型在集群两半跑两套并行策略」的实例。怎么做到的：权重怎么切、KV 怎么流动，中间的粘合剂就是 3FS。
+
 ## 3. KV 的「搬家」：3FS 是枢纽
 
-分离部署最贵的问题：**prefill 算出的 KV 在 P 节点的显存里，decode
-却发生在 D 节点**。KV 必须跨节点流动，而且流量巨大（每个 token、每层
-都要 K/V）。
+分离部署最贵的问题立刻出现：**prefill 算出的 KV 在 P 节点的显存里，decode 却发生在 D 节点。** KV 必须跨节点流动，而且流量不小——每个生成的 token、模型每一层都要写一段 K/V，乘上并发请求数，就是一条持续的数据河。
 
-DeepInfer 的答案：**KV 与「KV 到 slot 的映射」都归存储层所有** ——
-3FS（Fire-Flyer File System，DeepSeek 自研的高性能分布式文件系统）：
+DeepInfer 的答案是让 KV 彻底归存储层所有：**KV 数据本身和「哪个请求的哪个位置映射到哪个块」的块表，都以块为单位存在 3FS 上**（3FS 是 DeepSeek 自研的高性能分布式文件系统，为高吞吐随机读写设计，生产块大小 128 token）。P 节点算完 prefill，把 KV 块写进 3FS；D 节点接手请求时，按块表把需要的块挂载到本地显存，接着 decode；decode 过程中新增的 KV 块再持续写回。
 
-- KV 以**块**（生产块大小 128 token）为单位持久化在 3FS 上；
-- P 节点算完 prefill，块写入 3FS；D 节点按块表**挂载**这些块到本地
-  显存继续 decode；decode 新增的 KV 再写回；
-- **TTL 分级**：agent 流量 3 天、chat 流量 7 天（QA 原文数字）——
-  过期块自动回收，同一前缀的后续请求在 TTL 内直接命中，prefill 整段
-  跳过。
+只当「搬运工」还不足以解释它的地位。3FS 同时扮演三个角色：
 
-!!! tip "3FS 的三个身份"
-    1. **KV 总线**：E/P/D 之间 KV 的传输通道；
-    2. **前缀缓存仓库**：跨请求、跨时间、跨节点的块级复用；
-    3. **断点续算的持久层**：decode 节点故障，另一节点挂载同一批块
-       从断点继续 —— 请求不重头算。
+**KV 总线。** E/P/D 三类节点之间所有 KV 的流动都走它。节点间不需要点对点传输 KV——写的人写文件，读的人读文件，解耦了生产消费的时间差（P 算完可以先干别的，D 空闲了再挂载）。
 
-    一个存储组件同时解决三个架构级难题，这是 DeepInfer 架构里
-    最「划算」的一笔设计。
+**前缀缓存仓库。** KV 块持久化在 3FS 上并带 **TTL（存活时间）**：agent 流量 3 天、chat 流量 7 天（QA 文档原文数字）。 TTL 内，任何新请求只要前缀和已有块匹配，直接挂载复用，prefill 整段跳过——这比「进程内前缀缓存」强得多：跨请求（不同用户共享 system prompt）、跨时间（今天的请求命中昨天算过的块）、跨节点（任何 D 节点都能读）。
 
-## 4. 请求的完整旅程
+**断点续算的持久层。** D 节点故障时，另一台 D 节点挂载同一批 KV 块，从最后写入的位置继续 decode——请求不重头算，用户几乎无感。这是「把状态管起来」（第 02 章）在集群维度的形态。
 
-把全链路串起来（结合 QA 里的部署形态）：
+一个存储组件同时解决**传输、复用、容灾**三个架构级难题。回看第 02 章的结论——三个设计目标都压在 KV 生命周期管理上——3FS 就是那个管理器的物理载体。这也解释了为什么 DeepInfer 未开源的组件里恰好有「KV cache 管理」：它与 3FS 的块语义、集群拓扑深度耦合。
+
+## 4. 一个请求的完整旅程
+
+把全链路按时间顺序串一遍：
 
 ```text
-1. 用户请求 → 负载均衡 → E 节点分词、组装模板
-2. 调度决策：前缀能否命中 3FS 里的现存块？
-   命中  → 跳过命中的 prefill 段
-   未命中 → P 节点对剩余 prompt 段做 prefill（chunked）
-3. 新 KV 块写入 3FS；请求路由到某 D 节点
-4. D 节点挂载块表，进入 decode 循环：
+1. 请求到达 → 负载均衡 → E 节点：分词、按模板组装 → token id 序列
+2. 调度决策：前缀查询 3FS
+     命中   → 命中段直接挂载已有 KV 块，跳过这段 prefill
+     未命中 → 请求发往某个 P 节点，对剩余 prompt 段做（chunked）prefill
+3. P 节点算出的新 KV 块写入 3FS；请求路由到某个 D 节点
+4. D 节点挂载块表到本地显存，进入 decode 循环：
      组批（continuous batching）→ forward（FlashMLA）
      → （可选）DSpark 推测解码 → 采样 → 结构化输出掩码
-   新 KV 块持续写回 3FS
-5. EOS / max_tokens / stop → 终止，KV 块按 TTL 生命周期留存
+   新 KV 块随生成持续写回 3FS
+5. 终止条件（EOS / max_tokens / stop）→ 请求结束
+   KV 块不立即删除，按 TTL 留在 3FS 等待复用，过期自动回收
 ```
 
-注意第 2 步与第 4 步各有一个「调度让路」的时刻 —— 高峰期块池吃紧时，
-调度器会**抢占**低优先级请求（回收其 KV，状态回退，稍后重算）。
-miniflow 的 `demo_scheduler.py preempt` 一比一复刻了这个行为
-（[lab/04](../lab/04-scheduler.md)）。
+两个值得停留的瞬间。第 2 步的「前缀查询」是 TTFT 的大杀器：一条带 4000 token system prompt 的 agent 请求，如果 prompt 已在 3FS 里（TTL 内有人用过），prefill 只需算新增的对话部分。第 4 步的循环内部还有一个隐形的调度世界：块池吃紧时调度器会**抢占**低优先级请求——回收它的 KV 块、把它退回等待队列稍后重算，把显存让给更急的请求。抢占-重算的完整逻辑在 [第 07 章](07-scheduler.md)，miniflow 一比一复刻了这个行为。
 
-## 5. 为什么「负载均衡」是第二个未开源组件
+## 5. 负载均衡：分离架构的代价
 
-E/P/D 分离把「均衡」变成了三维难题：
+拆成三类节点后，「均衡」从一个问题变成三个：
 
-- **P 侧**：MoE 专家负载不均 → EPLB（Expert Parallelism Load
-  Balancer）动态重排专家放置（[第 05 章](05-parallelism.md)）；
-- **D 侧**：请求长度未知（事前不知道会生成多少 token）→ D 节点间
-  的请求数均衡天然滞后于真实负载；
-- **存储侧**：哪些块值得留在 3FS（TTL 之外的淘汰策略）本质是
-  流量预测问题。
+- **P 侧**：MoE 的专家负载天然不均（热门专家被路由的频率可能数倍于冷门专家），需要 EPLB 动态重排专家到卡的放置（[第 05 章](05-parallelism.md)）；
+- **D 侧**：请求会生成多长**事前未知**——按请求数均衡是滞后的，某台 D 节点可能恰好接了一堆长请求把显存驻满；
+- **存储侧**：哪些前缀值得留在 3FS（TTL 之外要不要续命），本质是流量预测问题。
 
-DeepInfer 未开源 KV cache 管理与负载均衡这两个组件 —— 大概率因为
-它们与内部集群拓扑、流量特征深度耦合，剥离不出「通用正确」的版本。
+这三个问题分别需要不同的信息（路由统计、生成长度分布、前缀热度），没有任何一个是「通用正确」的解——它们和 DeepSeek 内部的流量特征深度绑定。这就是第二个未开源组件「负载均衡」的由来：不是藏着掖着，而是离开它的流量土壤就没有意义。
 
 ---
 
 ## miniflow 对应实验
 
-miniflow 是单进程单机的，但把架构的**逻辑形态**完整保留：
+miniflow 是单进程单机引擎，跑不了集群，但把这套架构的**逻辑形态**完整保留了——你可以逐个模块对回本章概念：
 
 | DeepInfer | miniflow | 位置 |
 |---|---|---|
+| E 节点的分词/模板 | `Tokenizer.encode` | `miniflow/tokenizer.py` |
 | P/D 分离的流水 | `LLMEngine.step()`：prefill 与 decode 同批异构推进 | `miniflow/engine.py` |
 | 3FS 块级 KV | `PagedKVCache`：块池 + 块表 + 引用计数 | `miniflow/cache/paged_kv.py` |
-| 前缀缓存/TTL | `PrefixCache`：条目持块引用，跨序列复用 | `miniflow/cache/prefix_cache.py` |
-| 调度让路 | `Scheduler._preempt()`：最晚到达者被回收重算 | `miniflow/scheduler.py` |
-| 零开销批调度 | `AsyncLLMEngine`：双线程 schedule/forward 流水线 | `miniflow/engine.py` |
+| 前缀缓存 / TTL | `PrefixCache`：条目持块引用，跨序列复用 | `miniflow/cache/prefix_cache.py` |
+| 调度让路（抢占） | `Scheduler`：最晚到达者被回收重算 | `miniflow/scheduler.py` |
 
 ```bash
-python examples/demo_paged_kv.py      # 块的分配/回收/引用计数
-python examples/demo_prefix_cache.py  # 前缀命中跳过 prefill
-python examples/demo_scheduler.py preempt  # 抢占-重算-全部完成
+python examples/demo_paged_kv.py       # 块的分配/回收/引用计数
+python examples/demo_prefix_cache.py   # 前缀命中跳过 prefill
+python examples/demo_scheduler.py      # 抢占-重算-全部完成
 ```
 
 | 上一章 | 下一章 |

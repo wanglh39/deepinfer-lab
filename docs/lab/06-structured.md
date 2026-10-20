@@ -5,36 +5,34 @@
     - miniflow 代码：`miniflow/structured_output.py`、`miniflow/engine.py`
     - 前置阅读：[10 结构化输出](../guide/10-structured.md)
 
----
+guide 10 讲了两段式的架构（编译期自动机 + 运行期掩码）和「约束不扭曲分布」的数学。本章进代码：`GrammarAutomaton` 怎么把正则编译成 NFA、token 级掩码怎么在字符级自动机上工作、以及两个真实踩坑——一个状态机经典陷阱（初始状态硬编码），一个看似无害的 `strip()`。
 
 ## 1. Thompson NFA：正则子集的编译器
 
-`GrammarAutomaton.compile(pattern)` 实现正则子集（字面量 /
-`[a-z]` 字符类 / `.` / `*` / `|` / `()`）的 Thompson 构造 ——
-递归下降解析 + NFA 片段拼接，ε-转移串联结构与优先级。
+`GrammarAutomaton.compile(pattern)` 实现正则子集的 Thompson 构造：支持字面量、`[a-z]` 字符类、`.`、`*`、`|`、`()`。
 
-运行时是**字符级状态集**推进（NFA 天然多态并行）：
+构造的思路（[guide/10 第 2 节](../guide/10-structured.md) 补了 NFA 的直觉）：**每种语法构造对应一个小 NFA 片段，递归下降解析正则时把片段拼起来**。字面量 `a` 是「状态 1 --a--> 状态 2」；`A|B` 是两条 ε 分支（ε 转移 = 不消费字符的白跳）从同一个入口指向 A、B 两个片段；`A*` 是入口一条 ε 弯道绕过 A 再回到入口。解析器递归读 pattern，每一步返回「入口状态 + 出口状态」的片段，外层把它们串联——`new_state()` 每次分配新编号，保证片段间状态不冲突。
+
+运行时是**字符级状态集**推进（NFA 的多态性用「维护一个状态集合」实现）：
 
 ```python
 def _step_chars(self, states, text):
     for ch in text:                      # token 的每个字符
-        nxt |= 转移(states, ch)          # 状态集整体推进
-        states = eps_closure(nxt)
-        if not states: break             # 中途空 = 违约
+        nxt |= 转移(states, ch)          # 状态集整体推进一格
+        states = eps_closure(nxt)        # 沿 ε 边免费扩张
+        if not states: break             # 中途为空 = 这条路走死了
     return states
 
 def token_feasible(self, token_str):     # token 是否合法后继
     return bool(self._step_chars(set(self.states), token_str))
 ```
 
-**粒度问题的解法**（[guide/10 第 4 节](../guide/10-structured.md)）：
-token 喂给字符级自动机、允许**部分消费**（状态停在中间）—— 词表里
-`'▁r'` 这种「schema 前缀」token 因此合法。miniflow 的教学词表是
-最难的形态（空格独立成 token `'▁'`），实现无法取巧。
+**粒度问题的解法**（[guide/10 第 5 节](../guide/10-structured.md)）：token 喂给字符级自动机、允许**部分消费**（状态停在中间）——词表里 `'▁r'` 这种「pattern 前缀」token 因此合法。miniflow 的教学词表是最难的形态（空格独立成 token `'▁'`），实现无法取巧成「单 token 字符串匹配」。
 
 !!! danger "踩坑实录：初始状态硬编码 0"
+
     Thompson 构造的状态编号**从 1 开始**（`new_state()` 先自增再返回），
-    而 `_reset()` 曾硬编码初始状态 `{0}`：
+    而 `_reset()` 曾硬编码初始状态集合为 `{0}`：
 
     ```python
     # 错：状态 0 不存在于转移表 → closure({0}) = {0} → 永远空转
@@ -42,10 +40,14 @@ token 喂给字符级自动机、允许**部分消费**（状态停在中间）�
     # 任何 pattern 的第一步 mask 就报「语法死局」
     ```
 
-    修复：初始状态显式传入 —— `cls(trans, accept,
-    start_state=node.start)`。**隐式的编号起点约定是状态机经典陷阱**：
-    显式传递比隐式假设可靠一个数量级（这个 bug 让 SO demo 输出
-    空串直接 aborted，而 mask 观测段直接 ValueError）。
+    症状很有欺骗性：不是崩溃，是**每个 pattern 都在第一步死局**——
+    逻辑上「一切正常」，就是任何模式都走不通。修复：初始状态显式
+    传入（`cls(trans, accept, start_state=node.start)`）。
+
+    **隐式的编号起点约定是状态机经典陷阱**：显式传递比隐式假设
+    可靠一个数量级。0 起点还是 1 起点，语言和实现里两种都常见
+    （C 数组 0 起、Lua/Rust 枚举习惯各异）——凡是「魔法数字」，
+    都该问一句它从哪来。
 
 ## 2. 引擎集成：三个边界语义
 
@@ -67,32 +69,31 @@ masked[:_N_SPECIAL] = -np.inf
 masked = automaton.mask(masked, self.tokenizer.vocab)
 ```
 
-掩码在采样**前**施加 —— softmax 在掩码后归一化，合法 token 的相对
-概率完全保留（约束不扭曲分布，[guide/10 第 3 节](../guide/10-structured.md)）。
+边界一为什么必须显式处理：全 `-inf` 的 logits 喂给采样器，argmax 是未定义行为（平局任取）；「语法走完了」本身是合法完成，语义上就该 `FINISHED_STOPPED`。边界二同理：词表和语法无交集（模式要求字符 `z`、词表没有 `z`）时逐 token 掩码永远全空——明确 abort 优于静默产出垃圾。
 
-`_N_SPECIAL = 5` 对应词表前 5 位特殊 token（bos/eos/pad + 两个控制位）
-—— 与 [guide/11](../guide/11-recipe.md) 的 deepseek-recipe 防注入
-构成双保险。
+掩码在采样**前**施加——softmax 在掩码后归一化，合法 token 的相对概率完全保留（约束不扭曲分布，[guide/10 第 4 节](../guide/10-structured.md)）。`_N_SPECIAL = 5` 对应词表前 5 位特殊 token（bos/eos/pad + 两个控制位）——与 [guide/11](../guide/11-recipe.md) 的 deepseek-recipe 防注入构成双保险：约束生成期间，伪造的控制标记拿不到任何采样概率。
 
 ## 3. 词表事实：BPE 的空格是 `'▁'`
 
-教学 BPE（`miniflow/tokenizer.py`）里空格是**独立 token `'▁'`**，
-`ran`/`flew`/`in`/`over`/`the` 是各自独立的 token —— 「 ran」要
-`['▁', 'ran']` 两个 token 拼出。所以 pattern 必须写成：
+教学 BPE（`miniflow/tokenizer.py`）里空格是**独立 token `'▁'`**（GPT-2 同款），`ran`/`flew`/`in`/`over`/`the` 各自独立——「 ran」要 `['▁', 'ran']` 两个 token 拼出。所以 pattern 必须按 token 流的真实字符写：
 
 ```python
 PATTERN = "(▁ran|▁flew)(▁in|▁over)▁the"     # 字符级自动机的输入
 TEXT_EQUIV = r"( ran| flew)( in| over) the"  # decode 后的等价正则
 ```
 
-初始状态下唯一合法 token 是 `'▁'`（其它任何 token 的首字符都走不进
-pattern 的第一个分支）—— demo 的 mask 观测段直接展示这一点。
+初始状态下唯一合法的 token 是 `'▁'`——其它任何 token 的首字符都走不进 pattern 的第一个分支。demo 的 mask 观测段直接展示这一点（合法 token 列表 = `['▁']`）。
 
 !!! danger "踩坑实录：decode 的 strip() 吞前导空格"
-    tokenizer.decode 早期带 `.strip()` —— SO 输出 `'▁ran…'` 解码成
+
+    tokenizer.decode 早期带 `.strip()`——SO 输出 `'▁ran…'` 解码成
     `' ran…'` 后被 strip 成 `'ran…'`，模式匹配（要求前导空格）失败。
-    修复：decode 不做 strip —— **前导 `'▁'` 承载「续写新单词」的语义**，
-    结构化输出的匹配依赖它。
+
+    修复：decode 不做 strip——**前导 `'▁'` 承载「续写新单词」的语义**。
+    这个 bug 的教训比它看起来深：strip 是「输出更干净」的善意改动，
+    但它**静默改变了对外的语义边界**——对结构化输出，前导空格是
+    输出契约的一部分。改「看起来无害」的输出处理时，先问谁依赖
+    这个输出。
 
 ## 4. 动手实验
 
@@ -108,17 +109,19 @@ python -m pytest tests/test_structured.py -q
 ```
 
 ??? question "思考题"
+
     1. 把 pattern 改成 `(▁ran|▁flew)(▁in|▁over)▁the.*`（加 `.*`）：
        finish_reason 从 `finished_stopped` 变成什么？为什么？
        （提示：`.*` 让任何后继都合法 → `in_accept` 永真但
-       `has_feasible_token` 也永真 → 走 max_tokens 截断）
+       `has_feasible_token` 也永真 → 走 max_tokens 截断。）
     2. `advance` 返回 False（采出的 token 违约）在什么情况下发生？
        引擎此时为什么选 abort 而不是重采样？
-       （提示：mask 已保证 argmax 合法 —— 违约只可能来自掩码/推进
-       的不一致，是引擎 bug 的信号，fail-fast 优先）
-    3. 如何把「合法 token 集合」从 O(V·|pattern|) 的逐 token 模拟
-       加速？（提示：生产 xgrammar 预编译「状态 → 合法 token 位图」
-       的转移表 —— 编译期把运行期工作做掉，正是两段式的意义）
+       （提示：mask 已保证 argmax 合法——违约只可能来自掩码/推进
+       的不一致，是引擎 bug 的信号，fail-fast 优先。）
+    3. 如何把「合法 token 集合」的计算从 O(V·|pattern|) 的逐 token
+       模拟加速？（提示：生产 xgrammar 预编译「状态 → 合法 token
+       位图」的转移表——编译期把运行期工作做掉，正是两段式的意义，
+       呼应 [guide/12 原则五](../guide/12-philosophy.md)。）
 
 | 上一章 |
 |---|
