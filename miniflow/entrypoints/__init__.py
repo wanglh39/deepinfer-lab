@@ -1,0 +1,1 @@
+"""入口层 —— 对应 deepinfer/entrypoints（CLI / API server）。"""

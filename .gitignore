@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# C++ 扩展构建产物
+*.so
+*.pyd
+*.o
+*.obj
+csrc/build/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+
+# 文档站构建产物
+site/
+
+# 训练生成的 checkpoint（用 tools/train.py 重新生成）
+checkpoints/
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store

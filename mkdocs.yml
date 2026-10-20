@@ -1,0 +1,85 @@
+site_name: deepinfer-lab
+site_description: DeepInfer（DeepSeek 开源推理框架）底层原理与设计哲学解读 + 从零复刻教学引擎 miniflow
+site_url: https://example.github.io/deepinfer-lab/
+repo_name: deepinfer-lab
+repo_url: https://github.com/yourname/deepinfer-lab
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  palette:
+    - scheme: default
+      primary: deep purple
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: 切换到深色模式
+    - scheme: slate
+      primary: deep purple
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: 切换到浅色模式
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - toc:
+      permalink: true
+  - attr_list
+  - md_in_html
+  - footnotes
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
+
+
+nav:
+  - 首页: index.md
+  - 走进 DeepInfer:
+      - 01 总览：推理框架是什么: guide/01-overview.md
+      - 02 三大设计目标: guide/02-goals.md
+      - 03 总体架构：E/P/D 分离: guide/03-architecture.md
+  - 核心子系统:
+      - 04 内核层：FlashMLA/DeepGEMM/DeepEP: guide/04-kernels.md
+      - 05 并行策略：DP/EP/EPLB: guide/05-parallelism.md
+      - 06 KV Cache：分页/3FS/SWA/有界重放: guide/06-kvcache.md
+      - 07 调度器：Continuous Batching 与异步调度: guide/07-scheduler.md
+      - 08 推测解码：DSpark 与置信度调度: guide/08-speculative.md
+      - 09 采样：确定性与批次不变: guide/09-sampling.md
+      - 10 结构化输出: guide/10-structured.md
+  - 工程与文化:
+      - 11 deepseek-recipe 的工程哲学: guide/11-recipe.md
+      - 12 设计哲学总结：十条原则: guide/12-philosophy.md
+  - 动手实验室 (miniflow):
+      - lab/01-tensor.md
+      - lab/02-model.md
+      - lab/03-paged-kv.md
+      - lab/04-scheduler.md
+      - lab/05-speculative.md
+      - lab/06-structured.md
