@@ -32,7 +32,56 @@ accept_rate=0.96  tokens_per_step=5.0
 
 先推导它为什么成立。forward 的产出语义是：算掉序列的第 $n$ 个 token，得到**第 $n+1$ 个位置**的输出分布。反过来说：想采样第 $n+1$ 个 token，就必须 forward 到第 $n$ 个——**一个不多、一个不少**。0 个未算 token，forward 无活可干、无分布可产；2 个以上，等于把还没定的 token 当成已定去算了（它们此刻根本不存在）。
 
-所以 draft 的每一步都是「forward 最后那个 token → 得到下一位置分布 → 采样新 draft → append」。这条不变量贯穿三个交接点：prefill 交接（prefill 算完 prompt 后采样第 1 个输出 token，此时 `computed = num_tokens - 1`——最后那个 token 的 KV 留给 spec 的第一次 forward）、draft 循环（每次恰好推进 1）、提交回滚（下节）。
+### 2.1 不变量的数字版走查
+
+用一个具体序列把不变量走一遍（每一步建议手推 `computed` 和 `num_tokens` 的值）：
+
+```text
+设定：prompt 3 个 token（id 记为 [a,b,c]），k_draft=3
+
+prefill 结束：
+  token_ids = [a,b,c]（3 个已定）
+  computed  = 2  ← 注意：prefill 只算到第 2 个！
+  （第 2 个 c 的 KV 留给 spec 的第一次 forward——它算 c，
+    才得到第 3 位置的分布，采样出第 1 个输出 token）
+  不变量检查：num_tokens(3) - computed(2) = 1 ✓
+
+draft 第 1 轮（forward 位置 2 的 c）：
+  得到第 3 位置的分布 → 采出 draft₀
+  append 后 token_ids = [a,b,c,d₀]（4 个已定）
+  computed 推进到 3
+  不变量：4 - 3 = 1 ✓
+
+draft 第 2、3 轮：同理各推进 1 → computed = 5，token_ids 6 个
+
+验证（一次 forward 算 d₀,d₁,d₂ 三个位置 + 前面的）：
+  logits_list = 3 份分布（位置 3、4、5 各自的"下一 token"）
+  
+设第 2 个 draft 被拒（d₁ ≠ argmax(位置 4 的分布)）：
+  accepted = 1（d₀ 接受）
+  bonus = argmax(位置 4 的分布)（白拿的修正）
+  
+  keep_tokens = [d₀, bonus]（2 个提交）
+  提交后 token_ids = [a,b,c,d₀,bonus]（5 个）
+  kv_keep = base_len(3) + len(keep)(2) - 1 = 4
+  computed 回滚到 4
+  不变量：5 - 4 = 1 ✓ ← 下轮 draft 的第一次 forward 算 bonus
+```
+
+走查里三个关键时刻（不变量的三次「恰好」）：prefill 交接留 1 个（`computed = num_tokens - 1`）、draft 每轮推进恰 1、回滚后又是恰 1——**不变量像一根线，把三个阶段的交接缝在一起**。踩坑实录（下面）破坏的正是回滚那一针。
+
+### 2.2 为什么 bonus 不能标记「已算」
+
+踩坑的核心困惑值得单独展开（它最反直觉）：bonus token 的 logits 明明**存在**（验证批里 `logits_list[accepted]` 就是它位置的分布），为什么说它「从未进过 forward」？
+
+区分两个概念：
+
+- **「它的分布被算出来过」**——是的，验证 forward 在算被拒位置 d₁ 时，产出了「d₁ 之后该是什么」的分布，bonus 就是从这个分布采的——**分布是现成的**；
+- **「它自己的 KV 被写进过池子」**——没有！KV 是「token 作为输入参与 forward」的产物——bonus 从未作为输入参与任何 forward（它是在 forward **之后**才被采样确定的）——**它的 K/V 向量不存在**。
+
+不变量管的是第二件事（KV 进度），不是第一件（分布的可用性）。把 bonus 标记「已算」= 声称它有 KV = 下轮 forward 跳过它 = **后续所有 token 的注意力都缺了这一层的它**——输出静默错乱。`assert n > 0` 拦住的正是这个「跳过」。
+
+（分清楚「logits 可用」和「KV 已写」是 spec 实现的分水岭概念——生产代码里这两件事分别叫 `logits`（采样用）和 `computed/kv_cache`（推进用），混用必炸。）
 
 !!! danger "踩坑实录：回滚量算错，不变量破坏"
 
@@ -138,6 +187,24 @@ python -m pytest tests/test_speculative.py -q
     3. 没有 bonus 的 speculative sampling（纯拒绝采样）单步最差产出
        几个 token？有 bonus 呢？（提示：全拒时，前者 0、后者 1——
        验证 forward 的 logits 不能白花。）
+    4. 2.1 节的走查里，全接受分支的 `kv_keep = base + k - 1`——最后
+       1 个 keep token 的 KV 已写但被回滚标记「未算」，下轮重算一遍。
+       重算的数值和上次的写入**必然一致**吗？（提示：确定性前向
+       的前提——guide/09 的 batch-invariance。如果实现不 invariant，
+       覆盖写会发生什么？）这说明 spec 对哪章的内容有隐性依赖？
+    5. 手推一个「一步提交截断」的场景：max_tokens=24、已输出 22、
+       本步接受 3 + bonus 1 = 4 个 keep——`room` 算出来是多少、
+       截断后提交几个、kv_keep 怎么算？（提示：截断发生在回滚
+       **之前**还是之后会影响不变量——看代码确认顺序，然后论证
+       为什么这个顺序是对的。）
+
+## 6. 本章收获的自检
+
+1. 核心不变量是什么？它「恰好 1」的三个理由（0 无分布、2+ 算未定）？
+2. bonus 的「分布可用」vs「KV 未写」之分——为什么标记已算会导致注意力缺它？
+3. 统一公式 `kv_keep = base_len + len(keep_tokens) - 1` 为什么优于分支推导（一次验证覆盖全部）？
+4. 「批量推进的环节要重审逐 token 时代的边界检查」——max_tokens 越界的教训。
+5. 教学版 argmax 的可测试性优势：spec == greedy 成为回归钉子。
 
 | 上一章 | 下一章 |
 |---|---|
